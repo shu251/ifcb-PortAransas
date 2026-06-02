@@ -1,0 +1,101 @@
+---
+title: "ifcb-analysis"
+editor: source
+---
+
+```{r, warning=FALSE}
+# | warning: false
+# | message: false
+library(tidyverse)
+library(patchwork)
+library(svglite)
+library(scales)
+library(treemapify)
+library(compositions); library(vegan)
+```
+
+# Import compiled datasets
+
+```{r}
+load(file = "output-data/ifcb-data-04142025.RData", verbose = TRUE)
+```
+
+```{r}
+temp_sal_gauge_rain_moon_tide <- read.csv("output-data/allmetadata-04142025.csv")
+```
+
+```{r}
+hourly_metadata <- read.csv("output-data/hourly_allmetadata-04142025.csv")
+```
+
+```{r}
+combined_biol_metadata <- hourly_metadata %>% 
+  mutate(DATE = ymd(DATE)) %>% 
+  right_join(combined_gom_long_season, by = join_by(DATE, MONTH, HOUR))
+```
+
+```{r}
+head(combined_biol_metadata)
+```
+
+# What data do we have?
+
+> Can we use tidyverse lubridate to identify the gaps in the dataset?
+
+```{r, fig.width=14, fig.height=14}
+head(temp_sal_gauge_rain_moon_tide)
+# colnames(temp_sal_gauge_rain_moon_tide)
+temp_sal_gauge_rain_moon_tide |> 
+  mutate(YEAR = year(DATE),
+         temp = as.character(TEMP),
+         sal = as.character(SAL),
+         height = as.character(gage_height_ft),
+         precip = as.character(PRECIP_in),
+         diff = as.character(DIFFERENCE)) |> 
+  pivot_longer(cols = c(temp, sal, height, precip, Phase, diff), names_to = "VARIABLE", values_to = "VALUE") |>
+  select(DATE, DAY, HOUR, MIN, MONTH, YEAR, VARIABLE, VALUE) |> distinct() |> 
+  mutate(BIN = case_when(
+    is.na(VALUE) ~ "no",
+    TRUE ~ "yes"
+  )) |> 
+  # Add in month-date-min 
+  mutate(MD_min = paste(MONTH, DAY, HOUR, MIN, sep = "-")) |>
+  ggplot(aes(x = MD_min, y = VARIABLE, fill = BIN)) +
+    geom_tile() +
+  facet_grid(rows = vars(YEAR)) +
+  scale_fill_manual(values = c("white", "black")) +
+  theme_classic()
+  
+```
+
+```{r}
+head(combined_gom_long_season)
+
+```
+
+# Explore incoming vs. outgoing tide
+
+Separate below by hour and minute - need to look at high resolution parts of the dataset to look at impact of incoming and outgoing tide.
+
+```{r, fig.height=8, fig.width=30}
+head(combined_gom_long_season)
+head(temp_sal_gauge_rain_moon_tide)
+temp_sal_gauge_rain_moon_tide |> 
+  # mutate(DATE = ymd(DATE)) |> 
+  # mutate(hr = hour(HOUR), min)
+  select(DATE, HOUR, MIN, TEMP, DIFFERENCE, tide_direction) |> 
+  distinct() |> 
+  drop_na() |> 
+  right_join(combined_gom_long_season) |> 
+  filter(as_date(DATE) >= as_date("2008-08-15") & 
+           as_date(DATE) <= as_date("2008-09-30")) |> 
+  group_by(DATE, HOUR, MIN, TEMP, DIFFERENCE, tide_direction, COURSE_CLASSIFICATION) |> 
+    summarise(SUM_COUNT = sum(COUNT),
+              SUM_CARBON = sum(CARBON)) |> 
+  ggplot(aes(x = DATE, y = TEMP)) +
+    geom_point(aes(color = tide_direction))
+
+```
+
+
+We need to figure out how to remove the outgoing tide. 

@@ -1,0 +1,25 @@
+project:
+  type: website
+  output-dir: docs
+  render:
+    - ifcb-data-wrangle.qmd
+
+
+website:
+  title: "IFCB analysis | Port Aransas"
+  navbar:
+    left:
+      - href: ifcb-data-wrangle.qmd
+        text: Analysis
+
+format:
+  html:
+    theme: minty
+    css: styles.css
+    code-fold: true
+    toc: true
+    toc-location: left
+    number-sections: true
+    number-depth: 2
+
+
