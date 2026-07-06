@@ -342,17 +342,54 @@ head(tabs_d)
 tabs_d_qc <- tabs_d %>%
   select(date = X1, time = X2, temp = X4, sal = X9)
 head(tabs_d_qc)
-tabs_temp_sal_2010 <- tabs_d_qc %>% 
+tabs_temp_sal_2010 <- tabs_d_qc %>%
   mutate(DATE = mdy(date),
          MONTH = month(DATE),
          DAY = day(DATE),
          HOUR = hour(hms(time)),
-         MIN = minute(hms(time))) %>% 
-  select(DATE, MONTH, DAY, HOUR, MIN, TEMP = temp, SAL = sal) %>% 
-  filter(as_date(DATE) <= as_date("2017-08-24")) %>% 
+         MIN = minute(hms(time))) %>%
+  select(DATE, MONTH, DAY, HOUR, MIN, TEMP = temp, SAL = sal) %>%
+  filter(as_date(DATE) <= as_date("2017-08-24")) %>%
+  distinct()
+
+range(tabs_temp_sal_2010$DATE)
+```
+
+`tabs_D_salt.asc` is itself a concatenation of at least two overlapping TABS D
+downloads/deployments: ~13,000 of the ~85,000 unique (DATE, HOUR, MIN)
+timestamps in this file have more than one reading after removing exact
+duplicate rows. Almost all of these (2014-2015) are the *same* half-hour
+timestamp logged 2-4 times back-to-back with sub-noise-level differences
+(median TEMP/SAL spread of ~0.02), consistent with redundant overlapping
+downloads of the same sensor stream. A handful (e.g. 08/10/2015 02:30, where
+3 of 4 duplicate readings agree at ~36 psu and one reads 29.2 psu) are a
+single corrupted reading among otherwise-agreeing duplicates. And a small,
+contiguous block on 04/09/2012 08:00-20:30 (26 timestamps) is a genuinely
+different reading spliced in from what looks like a second sensor
+deployment - it breaks the file's chronological order (the very next line
+after it jumps back to 04/09 00:30 and re-reports the whole day with values
+that connect smoothly to 04/08 and 04/10), while the spliced-in block's
+values (23-24C / 32-34 psu) don't connect to either neighboring day.
+
+There's no independent source to arbitrate the 04/09/2012 conflict -
+`tabs_temp_vel` (below) only covers 2008-2010. Given that, and since picking
+"first" or "last" would silently encode an assumption about which download
+is authoritative with no evidence either way, we take the per-timestamp
+median of TEMP and SAL instead of an arbitrary single reading. This is a
+strict improvement over "keep first": it correctly recovers the majority
+reading in the corrupted-single-value cases (median of 4 values ignores one
+outlier), it is a sensible central estimate for the near-duplicate
+2014-2015 readings, and for the true two-way 04/09/2012 conflict it reports
+an honest average rather than silently picking a side.
+
+```{r}
+tabs_temp_sal_2010 <- tabs_temp_sal_2010 %>%
+  group_by(DATE, MONTH, DAY, HOUR, MIN) %>%
+  summarise(TEMP = median(TEMP), SAL = median(SAL), .groups = "drop") %>%
   add_column(NOTES = "temp and salinity from TABS D data water property data")
 
 range(tabs_temp_sal_2010$DATE)
+nrow(tabs_temp_sal_2010)
 ```
 
 Water Property Data (from TABS website).
