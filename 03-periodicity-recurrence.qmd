@@ -1,0 +1,568 @@
+---
+title: "03-periodicity-recurrence"
+format:
+  html:
+    code-fold: show
+    code-tools: true
+    code-copy: true
+    toc: true
+    toc-location: left
+    number-sections: true
+    number-depth: 2
+editor: source
+---
+
+Run after `02-overview-seasonality-stats.qmd`.
+
+# Set up
+
+`lomb` provides the Lomb-Scargle periodogram, which handles the uneven hourly sampling and gaps in IFCB records.
+
+```{r}
+#| label: libraries
+#| message: false
+library(tidyverse)
+library(lomb)
+```
+
+# Periodicity
+
+## Import data 
+
+```{r}
+#| label: import-blocks
+block_data <- read.csv("output-data/hourly-season-blocks.csv")
+```
+
+## Set parameters
+
+```{r}
+#| label: params-lomb
+min_period_h <- 3         # shortest period scanned (hours)
+max_period_h <- 400       # longest period scanned (hours); capped at one third of the block length
+ofac <- 4                 # oversampling factor for the periodogram
+min_obs_fit <- 200        # minimum usable hourly points in a block before it is scanned
+```
+
+## Define target cycles
+
+Peaks are labelled by the band they fall in. Edit the limits to add cycles of interest.
+
+```{r}
+#| label: bands
+band_table <- tribble(
+  ~BAND, ~lo, ~hi,
+  "Tidal (~12.4 h)", 11.5, 13.5,
+  "Diel (24 h)", 22.5, 25.5,
+  "Spring-neap (~14.8 d)", 300,410
+)
+```
+
+## Define functions
+
+Runs a periodogram for one block and returns the fit object.
+
+```{r}
+#| label: fit-function
+
+fit_lomb <- function(hrs, resid, from, to, ofac) {
+  to <- min(to, diff(range(hrs)) / 3)   # need >= 3 cycles inside the block
+  lsp(x = resid, times = hrs, from = from, to = to,
+      type = "period", ofac = ofac, plot = FALSE)
+}
+```
+
+Assigns a peak period to a target band.
+
+```{r}
+#| label: band-function
+assign_band <- function(period_h) {
+  case_when(
+    period_h >= band_table$lo[1] & period_h <= band_table$hi[1] ~ band_table$BAND[1],
+    period_h >= band_table$lo[2] & period_h <= band_table$hi[2] ~ band_table$BAND[2],
+    period_h >= band_table$lo[3] & period_h <= band_table$hi[3] ~ band_table$BAND[3],
+    TRUE ~ "Other"
+  )
+}
+```
+
+## Fit periodograms for chosen CELL_IDs
+
+Defines a function that fits one periodogram per block for each CELL_ID supplied.
+
+```{r}
+#| label: fits-function
+run_lomb_fits <- function(cell_ids) {
+  block_data |>
+    filter(CELL_ID %in% cell_ids) |>
+    select(CELL_ID, SEASON, BLOCK_ID, BLOCK_YEAR, hrs, RESID) |>   # drop columns that would split the groups
+    group_by(CELL_ID, SEASON, BLOCK_ID, BLOCK_YEAR) |>
+    filter(sd(RESID) > 0) |>                                       # flat series cannot be scanned
+    filter(sum(is.finite(RESID)) >= min_obs_fit) |>                # too few points cannot be scanned
+    nest(series = c(hrs, RESID)) |>
+    ungroup() |>
+    mutate(fit = map(series, ~ fit_lomb(.x$hrs, .x$RESID, min_period_h, max_period_h, ofac)))
+}
+```
+
+Runs periodicity check on CELL_IDs set in the params chunk.
+
+
+```{r}
+#| label: cell-id-lists
+meso_3 <- c("Teleaulax", "Mesodinium_rubrum", "Dinophysis")
+all_cell_ids <- c("Teleaulax","Akashiwo","Alexandrium","Azadinium","Brachidinium","Ceratoperidinium","Coolia","dino_mix","Dinophysis","Dinophysis_caudata","Gyrodinium","Heterocapsa_pseudotriquetra","Heterocapsa_rotundata","Heterocapsa_spp","Heterocapsa_triquetra","Karenia_brevis","Karenia_brevis_dividing","Karenia_spp","Karlodinium","Karlodinium_dividing","Katodinium","Margalefidinium","Oxyrrhis","Oxytoxum","Phalacroma","Polykrikos","Polykrikos_hartmannii","Prorocentrum_cordatum","Prorocentrum_spp","Prorocentrum_texanum","Prorocentrum_triestinum","Protoperidinium","Pyrophacus","Scrippsiella","Torodinium","Tripos","Tripos_horridum_muelleri","Warnowia","coccolithophorid","Chrysochromulina_lanceolata","Chrysochromulina_parkae","Ophiaster","Phaeocystis","Dinobryon","Ochromonas","Didinium_gargantua","Mesodinium_rubrum","scuticociliates","Cyrtostrombidium","Laboea","Strobilidium_sp","Strom_Strob_Mix","Strombidium_capitatum","Strombidium_conicum","Tontoniidae","Hypotrich","Tin_aggl","Tin_hyal","ciliate_small","Eutreptiella")
+```
+
+
+```{r}
+#| label: fits
+lomb_fits_meso3 <- run_lomb_fits(meso_3)
+lomb_fits <- run_lomb_fits(all_cell_ids)
+nrow(lomb_fits)   # number of blocks scanned
+```
+
+```{r}
+#| label: glimpse-fits
+glimpse(lomb_fits)
+```
+
+**lomb fits** reports a periodgram for each of the cell IDs input.
+
+* `scanned`: periods tested (in # of hours)
+* `power`: normalized power at each of those periods. Peaks mark candidate cycles, and higher power means more of the block's variance sits at that period
+* `peak`: highest power in th spectrum
+* `p.value`: probability that the peak would be this high by chance.
+* `sig.level`: assigned power needed for significant at alpha given to lsp()
+
+
+```{r}
+#| label: spectrum-check
+lomb_fits$fit[[1]]$p.value
+plot(lomb_fits$fit[[1]]$scanned, lomb_fits$fit[[1]]$power, type = "l", log = "x")
+```
+
+
+## Extract the dominant peak
+
+```{r}
+#| label: peaks
+lomb_results <- lomb_fits |>
+  mutate(
+    PEAK_PERIOD_H = map_dbl(fit, ~ .x$scanned[which.max(.x$power)]),  # period of the highest peak
+    PEAK_POWER = map_dbl(fit, ~ .x$peak),
+    P_VALUE = map_dbl(fit, ~ .x$p.value)
+  ) |>
+  select(-series, -fit) |>
+  mutate(BAND = assign_band(PEAK_PERIOD_H))   # multiple-testing correction is done in 03, after all CELL_IDs are combined
+
+# head(lomb_results)
+unique(lomb_results$BAND)
+```
+
+Explanation: For each row (cell ID) we hav eoutputs for:
+
+* `PEAK_PERIOD_H`: the period of the highest peak, in hours
+* `PEAK_POWER`: the height of that peak.
+* `P_VALUE`: the raw p-value of that peak.
+* `BAND`: which of your target cycles the peak falls in, or "Other".
+
+```{r}
+#| label: peak-histogram
+lomb_results |> count(CELL_ID, BAND)
+unique(lomb_results$BAND)
+table(lomb_results$BAND)
+```
+
+
+```{r}
+#| label: peak-histogram-by-cell
+#| fig-height: 12
+#| fig-width: 12
+# lomb_results |> count(CELL_ID, BAND)
+ggplot(lomb_results, aes(PEAK_PERIOD_H)) + geom_histogram(bins = 40) + facet_wrap(~ CELL_ID)
+```
+
+## Save
+
+Writes one file per CELL_ID, so rerunning a CELL_ID only overwrites its own results.
+
+```{r}
+#| label: save-lomb-peaks
+dir.create("output-data/lomb-peaks", recursive = TRUE, showWarnings = FALSE)
+
+lomb_results |>
+  group_split(CELL_ID) |>
+  walk(~ write.csv(.x, file = paste0("output-data/lomb-peaks/", make.names(unique(.x$CELL_ID)), ".csv"),
+                   row.names = FALSE))
+```
+
+### Plot periodograms
+
+One thin line per taxon x block, plus a median/upper-quartile summary per block.
+
+```{r}
+#| label: spectra
+spectra_taxa <- NULL   # set to one or more CELL_IDs to subset; NULL = all taxa
+spectra_plot <- lomb_fits |>
+  filter(is.null(spectra_taxa) | CELL_ID %in% spectra_taxa) |>
+  mutate(spec = map(fit, ~ tibble(period_h = .x$scanned, power = .x$power))) |>
+  select(CELL_ID, SEASON, BLOCK_ID, BLOCK_YEAR, spec) |>
+  unnest(spec)
+head(spectra_plot)
+```
+
+One thin line per taxon x block, coloured by year. Many lines means many taxa; this is slow to draw for all taxa.
+
+```{r}
+#| label: fig-spectra
+#| fig-width: 10
+#| fig-height: 6
+spectra_plot |>
+  ggplot(aes(x = period_h, y = power, color = factor(BLOCK_YEAR),
+             group = interaction(CELL_ID, BLOCK_ID))) +
+  geom_line(alpha = 0.15, linewidth = 0.2) +
+  geom_vline(xintercept = c(12.4, 24), linetype = "dashed") +   # tidal and diel periods
+  scale_x_log10() +
+  facet_wrap(~ SEASON, scales = "free_y") +
+  labs(x = "Period (hours, log scale)", y = "Normalised power", color = "Year") +
+  theme_classic()
+```
+
+Median (line) and upper quartile (dotted) of power across taxa within each block. A peak in the median means most taxa share it.
+
+```{r}
+#| label: fig-spectra-summary
+#| fig-width: 10
+#| fig-height: 6
+spectra_summary <- spectra_plot |>
+  group_by(SEASON, BLOCK_ID, BLOCK_YEAR, period_h) |>
+  summarise(median_power = median(power), q75_power = quantile(power, 0.75), .groups = "drop")
+
+spectra_summary |>
+  ggplot(aes(x = period_h, color = factor(BLOCK_YEAR), group = BLOCK_ID)) +
+  geom_line(aes(y = median_power), alpha = 0.8) +
+  geom_line(aes(y = q75_power), alpha = 0.5, linetype = "dotted") +
+  geom_vline(xintercept = c(12.4, 24), linetype = "dashed") +
+  scale_x_log10() +
+  facet_wrap(~ SEASON, scales = "free_y") +
+  labs(x = "Period (hours, log scale)", y = "Normalised power across taxa", color = "Year") +
+  theme_classic()
+```
+> WHen we see a lot of peaks at the tidal (12.4) and the daily cycle, that means that there is a cycle recurring, it happens year after year. 
+
+> We see a lot of peaks up at the 355 period (hour) mark. This means it is a Spring-neap cycle that is appearing.
+
+> An overall creeping upwards towards the upper period hours means that we see autocorrelation, where there are a lot of period cycles without a cycle detected. We'd expect the power to start rising slowly. 
+
+
+
+## Additional periodicity analyses
+
+Run after the dominant-peak extraction above. This section uses `lomb_results`.
+
+
+```{r}
+#| label: params-additions
+season_order <- c("Cool", "Spring freshening", "Hot hypersaline", "Autumn low-inflow")
+
+```
+
+### Addition 1: What are the dominant peaks?
+
+Shows where the dominant peak of each block falls across all periods, and adds bands for synoptic (cold-front, 3-10 d) variability. The original `band_table` is left unchanged; `extended_bands` is used only in these additions.
+
+
+```{r}
+#| label: extended-bands
+extended_bands <- tribble(
+  ~BAND, ~lo, ~hi,
+  "Tidal (~12.4 h)", 11.5, 13.5,
+  "Diel (24 h)", 22.5, 25.5,
+  "Synoptic (3-10 d)", 72, 240,
+  "Spring-neap (~14.8 d)", 300, 410
+)
+
+assign_band_ext <- function(period_h, bands = extended_bands) {
+  idx <- map_int(period_h, \(p) {
+    hit <- which(p >= bands$lo & p <= bands$hi)
+    if (length(hit)) hit[1] else NA_integer_
+  })
+  coalesce(bands$BAND[idx], "Other")
+}
+```
+
+
+```{r}
+#| label: peak-bands
+peak_bands <- lomb_results |>
+  mutate(BAND_EXT = assign_band_ext(PEAK_PERIOD_H),
+         SEASON = factor(SEASON, levels = season_order))
+
+band_share_season <- peak_bands |>
+  count(SEASON, BAND_EXT) |>
+  group_by(SEASON) |>
+  mutate(PROP = n / sum(n)) |>
+  ungroup()
+band_share_season
+
+band_share_taxon <- peak_bands |>
+  count(CELL_ID, SEASON, BAND_EXT) |>
+  group_by(CELL_ID, SEASON) |>
+  mutate(PROP = n / sum(n)) |>
+  ungroup()
+```
+
+
+```{r}
+#| label: fig-peak-distribution
+#| fig-width: 10
+#| fig-height: 6
+peak_bands |>
+  ggplot(aes(x = PEAK_PERIOD_H)) +
+  geom_histogram(bins = 40) +
+  geom_vline(xintercept = c(12.4, 24, 355), linetype = "dashed") +
+  scale_x_log10() +
+  facet_wrap(~ SEASON) +
+  labs(x = "Period of dominant peak (hours, log scale)", y = "Number of taxon x block spectra") +
+  theme_classic()
+```
+
+
+```{r}
+#| label: fig-band-share
+#| fig-width: 8
+#| fig-height: 5
+band_share_season |>
+  ggplot(aes(x = SEASON, y = PROP, fill = BAND_EXT)) +
+  geom_col() +
+  labs(x = NULL, y = "Proportion of blocks", fill = "Dominant band") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+#| label: save-band-share
+write.csv(band_share_taxon, file = "output-data/dominant-band-share.csv", row.names = FALSE)
+```
+
+
+
+# Recurrence
+
+## Import data
+
+```{r}
+#| label: import-peaks
+lomb_results <- list.files("output-data/lomb-peaks", pattern = "\\.csv$", full.names = TRUE) |>
+  map(read.csv) |>          # one file per CELL_ID from script 02
+  bind_rows()
+```
+
+# Set parameters
+
+
+```{r}
+#| label: params-recurrence
+alpha <- 0.05             # significance level after BH correction
+min_blocks <- 3           # minimum significant years before a cycle is called recurring
+min_prop <- 0.5           # minimum fraction of a season's years showing the cycle
+```
+
+# Correct for multiple testing
+
+One correction across every CELL_ID and block analysed.
+
+```{r}
+#| label: adjust
+lomb_results <- lomb_results |>
+  mutate(
+    P_ADJ = p.adjust(P_VALUE, method = "BH"),   # BH across all CELL_IDs x blocks
+    SIGNIFICANT = P_ADJ < alpha
+  )
+
+glimpse(lomb_results)
+unique(lomb_results$BAND)
+```
+
+# Count how often each cycle appears
+
+A cycle recurs when the same band holds the dominant, significant peak in most years of that season.
+
+```{r}
+#| label: n-blocks
+n_blocks <- lomb_results |>
+  count(SEASON, CELL_ID, name = "N_BLOCKS")   # years available per season and taxon
+n_blocks
+```
+
+> SKH: noted change here — `recurrence` now keeps non-significant dominant peaks too. New columns: `N_DOMINANT` (all dominant peaks in the band), `PROP_DOMINANT`, and `PERIOD_MIN_H` / `PERIOD_MAX_H` (spread of significant periods). `N_SIG`, `PROP_BLOCKS` and `RECURRING` keep their meaning (significant blocks only); bands with no significant block now appear with `N_SIG = 0` so absences show as blank-to-zero tiles in `fig-recurrence`.
+
+```{r}
+#| label: recurrence
+# unique(lomb_results$BAND)
+recurrence <- lomb_results |>
+  filter(BAND != "Other") |>
+  mutate(SIG = SIGNIFICANT %in% TRUE) |>        # NA p-values count as not significant
+  group_by(SEASON, CELL_ID, BAND) |>
+  summarise(
+    N_DOMINANT = n(),                           # blocks whose dominant peak fell in this band (significant or not)
+    N_SIG = sum(SIG),                           # of those, blocks significant after BH
+    MEDIAN_PERIOD_H = if (any(SIG)) median(PEAK_PERIOD_H[SIG]) else NA_real_,   # periods below use significant blocks only
+    PERIOD_MIN_H = if (any(SIG)) min(PEAK_PERIOD_H[SIG]) else NA_real_,         # spread of periods = how stable the cycle is
+    PERIOD_MAX_H = if (any(SIG)) max(PEAK_PERIOD_H[SIG]) else NA_real_,
+    .groups = "drop"
+  ) |>
+  left_join(n_blocks, by = c("SEASON", "CELL_ID")) |>
+  mutate(
+    PROP_DOMINANT = N_DOMINANT / N_BLOCKS,
+    PROP_BLOCKS = N_SIG / N_BLOCKS,             # fraction of years significant (used by the recurrence rule and figure)
+    RECURRING = N_SIG >= min_blocks & PROP_BLOCKS >= min_prop
+  )
+
+head(recurrence)
+recurrence |> arrange(desc(PROP_BLOCKS))
+(unique(recurrence$BAND))
+# table(recurrence$BAND)
+```
+
+```{r}
+#| label: diel-summary
+
+diel_summary <- recurrence |>
+  filter(BAND != "Other", RECURRING) |>
+  mutate(SEASON = factor(SEASON, levels = season_order)) |>
+  arrange(CELL_ID, SEASON) |>
+  group_by(CELL_ID) |>
+  summarise(DIEL_SEASONS = str_c(SEASON, collapse = "; "), .groups = "drop")
+diel_summary
+```
+
+
+# Save
+
+```{r}
+#| label: save-recurrence
+write.csv(recurrence, file = "output-data/cycle-recurrence.csv", row.names = FALSE)
+```
+
+# Plot
+
+Fraction of years in which each cycle dominates, per season and taxon. Outlined tiles meet the recurrence rule.
+
+```{r}
+#| label: fig-recurrence
+#| fig-width: 10
+#| fig-height: 6
+recurrence |>
+  ggplot(aes(x = SEASON, y = CELL_ID, fill = PROP_BLOCKS)) +
+  geom_tile(aes(color = RECURRING), linewidth = 0.8) +
+  scale_color_manual(values = c("TRUE" = "black", "FALSE" = NA), guide = "none") +
+  scale_fill_viridis_c(limits = c(0, 1)) +
+  facet_wrap(~ BAND) +
+  labs(x = NULL, y = NULL, fill = "Fraction of years") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Summary by CELL_ID
+
+One row per CELL_ID (every name in `all_cell_ids`, including any that were not analysed). A CELL_ID is called *significant* when the dominant peak of at least one season block is significant after BH correction (`SIGNIFICANT`, from the `adjust` chunk). Bands come from `extended_bands` (Addition 1); peaks that fall outside every band are labelled "Other" and keep their period so you can see what they are. *Recurring* uses the same rule as above (`min_blocks` significant blocks and at least `min_prop` of that season's blocks in the same band).
+
+These p-values assume white noise, so read "significant" as generous, not conservative.
+
+```{r}
+#| label: cell-id-summary-build
+band_short <- c("Tidal (~12.4 h)" = "tidal", "Diel (24 h)" = "diel",
+                "Synoptic (3-10 d)" = "synoptic", "Spring-neap (~14.8 d)" = "springneap",
+                "Other" = "other")
+
+blocks_all <- lomb_results |>
+  mutate(BAND_EXT = assign_band_ext(PEAK_PERIOD_H),
+         SEASON = factor(SEASON, levels = season_order))
+
+# blocks analysed per CELL_ID x season
+blocks_per_season <- blocks_all |> count(CELL_ID, SEASON, name = "N_BLOCKS")
+
+# significant dominant peaks per CELL_ID x season x band
+sig_by_season <- blocks_all |>
+  filter(SIGNIFICANT) |>
+  group_by(CELL_ID, SEASON, BAND_EXT) |>
+  summarise(N_SIG = n(), MEDIAN_PERIOD_H = median(PEAK_PERIOD_H), .groups = "drop") |>
+  left_join(blocks_per_season, by = c("CELL_ID", "SEASON")) |>
+  mutate(RECURRING = N_SIG >= min_blocks & N_SIG / N_BLOCKS >= min_prop)
+
+# one text string per CELL_ID: season, band, median period, blocks significant / analysed
+signature_text <- sig_by_season |>
+  arrange(CELL_ID, SEASON, desc(N_SIG)) |>
+  mutate(TXT = str_c(SEASON, ": ", BAND_EXT, " ~", round(MEDIAN_PERIOD_H, 1), " h (",
+                     N_SIG, "/", N_BLOCKS, " blocks", if_else(RECURRING, ", recurring", ""), ")")) |>
+  group_by(CELL_ID) |>
+  summarise(SIGNATURES = str_c(TXT, collapse = "; "),
+            RECURRING_ANY = any(RECURRING),
+            .groups = "drop")
+
+# significant peaks per CELL_ID x band, and the band with the most
+band_totals <- blocks_all |>
+  filter(SIGNIFICANT) |>
+  group_by(CELL_ID, BAND_EXT) |>
+  summarise(N_SIG = n(), MEDIAN_PERIOD_H = median(PEAK_PERIOD_H), .groups = "drop")
+
+main_signature <- band_totals |>
+  group_by(CELL_ID) |>
+  slice_max(N_SIG, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  transmute(CELL_ID, MAIN_BAND = BAND_EXT, MAIN_PERIOD_H = round(MEDIAN_PERIOD_H, 1))
+
+band_counts <- band_totals |>
+  mutate(COL = factor(str_c("N_SIG_", band_short[BAND_EXT]),
+                      levels = str_c("N_SIG_", band_short))) |>
+  select(CELL_ID, COL, N_SIG) |>
+  pivot_wider(names_from = COL, values_from = N_SIG, values_fill = 0, names_expand = TRUE)
+
+cell_totals <- blocks_all |>
+  group_by(CELL_ID) |>
+  summarise(N_BLOCKS = n(),
+            N_SIGNIFICANT = sum(SIGNIFICANT),
+            MIN_P_ADJ = signif(min(P_ADJ), 3),
+            .groups = "drop")
+```
+
+
+```{r}
+#| label: cell-id-summary-table
+status_levels <- c("Significant and recurring", "Significant, not recurring",
+                   "No significant periodicity", "Not analysed (no block passed the filters)")
+
+cell_id_summary <- tibble(CELL_ID = union(all_cell_ids, unique(lomb_results$CELL_ID))) |>
+  left_join(cell_totals, by = "CELL_ID") |>
+  left_join(main_signature, by = "CELL_ID") |>
+  left_join(band_counts, by = "CELL_ID") |>
+  left_join(signature_text, by = "CELL_ID") |>
+  mutate(across(starts_with("N_SIG_"), ~ replace_na(.x, 0)),
+         RECURRING_ANY = replace_na(RECURRING_ANY, FALSE),
+         STATUS = case_when(is.na(N_BLOCKS) ~ status_levels[4],
+                            N_SIGNIFICANT == 0 ~ status_levels[3],
+                            RECURRING_ANY ~ status_levels[1],
+                            TRUE ~ status_levels[2]),
+         SIGNATURES = replace_na(SIGNATURES, "-")) |>
+  arrange(match(STATUS, status_levels), desc(N_SIGNIFICANT), CELL_ID) |>
+  select(CELL_ID, STATUS, N_BLOCKS, N_SIGNIFICANT, MAIN_BAND, MAIN_PERIOD_H,
+         starts_with("N_SIG_"), SIGNATURES, MIN_P_ADJ)
+
+count(cell_id_summary, STATUS)
+glimpse(cell_id_summary)
+```
+
+```{r}
+#| label: save-cell-id-summary
+write.csv(cell_id_summary, file = "output-data/cell-id-periodicity-summary.csv", row.names = FALSE)
+```
+
+# Session Info
+
+```{r}
+#| label: session-info
+sessionInfo()
+```
+

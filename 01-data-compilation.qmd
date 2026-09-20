@@ -1,0 +1,448 @@
+---
+title: "01-data-compilation"
+format:
+  html:
+    code-fold: show
+    code-tools: true
+    code-copy: true
+    toc: true
+    toc-location: left
+    number-sections: true
+    number-depth: 2
+editor: source
+---
+
+# Set-up
+
+```{r, warning=FALSE}
+# | warning: false
+# | message: false
+library(tidyverse)
+library(patchwork)
+library(svglite)
+library(scales)
+library(treemapify)
+library(compositions); library(vegan)
+library(clustMixType)
+library(lunar)
+```
+
+# Preliminary input data
+
+All data from Port Aransas. Counts by hour. Remove data before January 1 2008, as it was newly deployed and has some inconsistencies. Also using lubridate to convert to R-friendly date/time formats. Note that Hurricane Harvey destroyed the pier housing the IFCB, so data stop right when Harvey was hitting the coastline.
+
+Time zone is UTC and units of carbon are pg C per cell.
+
+```{r}
+# head(counts)
+counts <- read.csv("input-ifcb-data/counts_hourly_Hu.csv") |>  
+  # Use lubridate package to assign "date" format.
+  mutate(DAY = ymd_hms(X)) %>% 
+  mutate(DATE = date(DAY),
+         MONTH = month(DAY),
+         HOUR = hour(DAY),
+         MIN = minute(DAY)) %>% 
+  select(DAY, DATE, MONTH, HOUR, MIN, everything(), -X) %>% 
+  filter(as_date(DAY) >= as_date("2008-01-01") & 
+           as_date(DAY) <= as_date("2017-08-24"))
+# glimpse(counts)
+# range(counts$DAY)
+# head(counts)
+```
+
+Carbon biomass by day. pgC per cell.
+
+```{r}
+carbon <- read.csv("input-ifcb-data/carbon_hourly.csv") %>% 
+  mutate(DAY = ymd_hms(X)) %>% 
+  mutate(DATE = date(DAY),
+         MONTH = month(DAY),
+         HOUR = hour(DAY),
+         MIN = minute(DAY)) %>% 
+  select(DAY, DATE, MONTH, HOUR, MIN, everything(), -X) %>% 
+  filter(as_date(DAY) >= as_date("2008-01-01") & 
+           as_date(DAY) <= as_date("2017-08-24"))
+# head(carbon)
+
+range(carbon$DAY)
+# glimpse(carbon)
+```
+
+
+Subset so dataset includes "2008-01-01" to "2017-08-24".
+
+```{r}
+head(carbon)
+head(counts)
+```
+
+### Export taxa names for manual curation
+
+Export for manual curation
+
+```{r}
+# tax_export <- counts %>% 
+#     pivot_longer(cols = -c(DAY), names_to = "CELL_ID", values_to = "COUNT") %>% #Add in time here when we have it.
+#     select(CELL_ID) %>% distinct()
+```
+
+### Add taxa curated to cell IDs and carbon data
+
+Siddarth contributed to this taxa list.
+
+```{r}
+tax_curated <- read.csv("input-ifcb-data/tax-list.csv") |>
+  select(CELL_ID:Species) 
+```
+
+Add to cell ID information
+
+```{r}
+counts_long_wtax <- counts %>% 
+  pivot_longer(cols = -c(DAY, DATE, MONTH, HOUR, MIN), names_to = "CELL_ID", values_to = "COUNT", values_drop_na = TRUE) %>% 
+  filter(COUNT > 0) %>% 
+  left_join(tax_curated)
+
+head(counts_long_wtax)
+# range(counts_long_wtax$COUNT)
+```
+
+Add to carbon data
+
+```{r}
+carbon_long_wtax <- carbon %>% 
+  pivot_longer(cols = -c(DAY, DATE, MONTH, HOUR, MIN), names_to = "CELL_ID", values_to = "CARBON", values_drop_na = TRUE) %>% 
+  filter(CARBON > 0) %>% 
+  left_join(tax_curated)
+
+# head(carbon_long_wtax)
+# range(carbon_long_wtax$CARBON)
+```
+
+```{r}
+save(carbon_long_wtax, counts_long_wtax, file = "output-data/counts-carbon-data-ifcb.RData")
+```
+
+
+## Combine carbon and cell counts
+
+_Optional_
+```{r}
+combined_gom_long <- carbon_long_wtax %>% 
+  left_join(counts_long_wtax)
+```
+
+Types of classifications in dataset.
+
+```{r}
+table(combined_gom_long$COURSE_CLASSIFICATION)
+table(combined_gom_long$TYPE)
+# glimpse(combined_gom_long)
+# table(combined_gom_long$COURSE_CLASSIFICATION)
+```
+
+> What is the range of cellular carbon for each cell ID?
+
+There are 130 entries.
+
+```{r}
+length(unique(combined_gom_long$CELL_ID))
+# unique(combined_gom_long$Phylum)
+```
+
+```{r, fig.height=7, fig.width=28}
+rm <- c("IFCB excess", "Larvae")
+# hist(combined_gom_long$CARBON)
+combined_gom_long %>% 
+  # filter(!(COURSE_CLASSIFICATION %in% rm)) %>% 
+  filter(COURSE_CLASSIFICATION == "Microeukaryote") %>%
+  # filter(Supergroup == "Alveolata") %>% 
+  ggplot(aes(x = CELL_ID, y = CARBON, fill = Phylum)) +
+  geom_violin() +
+  facet_grid(cols = vars(Phylum), scales = "free_x", space = "free_x") +
+  # facet_wrap(vars(Phylum), scales = "free", as.table = FALSE) +
+  theme_classic() +
+  scale_y_log10() +
+  labs(x = "", y = bquote("pg C"~cell^-1)) +
+  theme(legend.position = "bottom", legend.title = element_blank(),
+        strip.text.y = element_text(color = "black", face = "bold", size = 14),
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        axis.text.x = element_text(color = "black", size = 10, angle = 45, vjust = 1, hjust = 1),
+        axis.title = element_text(color = "black", size = 10),
+        axis.text.y = element_text(color = "black", size = 10),
+        panel.grid.major = element_line(color = "#d9d9d9", linewidth = 0.2))
+# ?facet_wrap()
+```
+
+
+# Seasonal definition
+
+Make data frames to assign season
+
+Spring = March 1 - May 31 Summer = June 1 - Aug 31 Fall = Sept 1 - Nov 30 Winter = Dec 1 - Feb (March 1 (-1))
+
+Make a new dataframe to just add seasons (manually) to the date. I'm subsetting to 2024 to include leap day years.
+
+```{r}
+# df_season <- counts %>% 
+#   pivot_longer(cols = -c(DAY, DATE, MONTH, HOUR), names_to = "CELL_ID", values_to = "COUNT") %>%
+#   mutate(DATA_GAP = case_when(
+#     is.na(COUNT) ~ "Missing",
+#     TRUE ~ "Not missing"
+#   )) |> 
+#   mutate(date_tmp =  as.Date(format(DAY, '2024-%m-%d')), 
+#         SEASON = case_when(between(date_tmp, ymd('2024-03-01'), ymd('2024-05-31')) ~ "Spring",
+#                            between(date_tmp, ymd('2024-06-01'), ymd('2024-08-31')) ~ "Summer", 
+#                            between(date_tmp, ymd('2024-09-01'), ymd('2024-11-30')) ~ "Fall", 
+#                            TRUE ~ "Winter")) %>% # Winter needs to be "else" because you can't select between.
+#   select(DAY, date_tmp, SEASON, DATA_GAP) |> distinct() |> 
+#   mutate(YEAR = year(DAY),
+#          MONTH = month(DAY),
+#          DATE = day(DAY),
+#          HOUR = hour(DAY)) |> 
+#   group_by(SEASON) |> 
+#   mutate(month_start_tmp = case_when(
+#     SEASON == "Winter" ~ max(MONTH),
+#     TRUE ~ min(MONTH)),
+#     year_start_tmp = case_when(SEASON == "Winter" ~ YEAR - 1,
+#                                TRUE ~ YEAR),
+#     ) |> 
+#   mutate(month_end_tmp = case_when(
+#     SEASON == "Winter" ~ 2,
+#     TRUE ~ max(MONTH))) |> 
+#   group_by(SEASON, MONTH) |> 
+#   mutate(day_start_tmp = min(day(DAY)),
+#          day_end_tmp = case_when(
+#            (SEASON == "Winter" & leap_year(YEAR) == TRUE) ~ 29,
+#            (SEASON == "Winter" & leap_year(YEAR) == FALSE) ~ 28,
+#            (SEASON == "Summer" | SEASON == "Spring") ~ 31,
+#            SEASON == "Fall" ~ 30
+#          )) |> 
+#   ungroup() |> 
+#   unite("start", year_start_tmp, month_start_tmp, day_start_tmp, sep = "-", remove = FALSE) |> 
+#   unite("end", YEAR, month_end_tmp, day_end_tmp, sep = "-", remove = FALSE) |> 
+#   mutate(START = ymd(start),
+#          END = ymd(end),
+#          START_noy = mdy(paste(month(START), day(START), "2024", sep = "-")),
+#          END_noy = mdy(paste(month(END), day(END), "2024", sep = "-"))) |> 
+#   select(DAY, DATE, MONTH, YEAR, HOUR, SEASON, START, END, START_noy, END_noy) |> distinct()
+# 
+# # head(df_season)
+# # View(df_season |> select(SEASON, START, END) |> distinct())
+# df_oneyear <- df_season |> 
+#   mutate(DATE = mdy(paste(month(DAY), day(DAY), "2024", sep = "-"))) |> 
+#   select(SEASON, START_noy, END_noy, DATE) |> 
+#   # filter(!(SEASON == "Winter" & (month(START_noy) == 12))) |> 
+#   distinct()
+# # head(df_oneyear)
+# 
+
+```
+
+Re-evaluate seasons
+```{r}
+seasons <- tribble(~season, ~start_doy, ~end_doy,
+  "Cool", 340, 113,
+  "Spring freshening",114, 182,
+  "Hot hypersaline", 183, 251,
+  "Autumn low-inflow", 252, 339) |>
+  mutate(
+    start_date = format(as_date("2001-01-01") + (start_doy - 1), "%b %d"),
+    end_date = format(as_date("2001-01-01") + (end_doy - 1),   "%b %d"),
+    dates = str_c(start_date, " - ", end_date),
+    n_days = if_else(end_doy >= start_doy,
+                     end_doy - start_doy + 1,
+                     365 - start_doy + 1 + end_doy))
+
+```
+
+function to assign season
+```{r}
+assign_season <- function(doy) {
+  case_when(
+    doy >= 340 | doy <= 113 ~ "Cool",
+    doy <= 182 ~ "Spring freshening",
+    doy <= 251~ "Hot hypersaline",
+    TRUE ~ "Autumn low-inflow")
+}
+```
+
+```{r}
+head(counts_long_wtax)
+```
+
+
+Add seasons to count and carbon data
+```{r}
+counts_seasonal <- counts_long_wtax %>% 
+  mutate(DATA_GAP = case_when(
+    is.na(COUNT) ~ "Missing",
+    TRUE ~ "Not missing"
+  )) |> 
+  mutate(YEAR = year(DAY),
+         doy = yday(DAY)) |> 
+  mutate(SEASON = assign_season(doy))
+# unique(counts_seasonal$doy)
+unique(counts_seasonal$SEASON)
+
+
+carbon_seasonal <- carbon_long_wtax %>% 
+  mutate(DATA_GAP = case_when(
+    is.na(CARBON) ~ "Missing",
+    TRUE ~ "Not missing"
+  )) |> 
+  mutate(YEAR = year(DAY),
+         doy = yday(DAY)) |> 
+  mutate(SEASON = assign_season(doy))
+```
+
+**Seasons**
+
+* _Cool_ : Dec-Feb, cold fronts add low temperatures and stronger mixing from wind. 
+* _Spring freshening_ : Mar-June, start seeing increased rain, and therefore lower salinity values, increased nutrients and increased riverine height.
+* _Hot Hypersaline_ : Lower inflow from rivers, drought-risk season, high evaporation, warm, stratified conditions start emerging. Increased salinity. July-sept
+* _Autumn low-inflow_ : Oct-Nov, increased salinity continues into the Fall, but temperatures start declining. water column usually remains stratefied, some major storms will arise and add punctuated mixing.
+
+```{r}
+# counts_seasonal
+```
+
+# Add metadata
+
+See script `environmental-data-compilation.qmd` to gather all environmental data.
+
+```{r}
+load("input-env-data/metadata-09202026.RData", verbose = TRUE)
+```
+
+> Confirm QC here for all metadata
+
+```{r}
+str(metadata_storms_env)
+# unique(metadata_storms_env$MIN)
+```
+```{r}
+head(counts_seasonal)
+unique(counts_seasonal$HOUR)
+```
+
+```{r}
+head(metadata_storms_env)
+unique(metadata_storms_env$HOUR)
+```
+
+
+```{r}
+dim(metadata_storms_env); dim(counts_seasonal)
+
+re_df <- metadata_storms_env |>
+  select(-any_of(c("DAY", "MONTH", "MIN"))) |>
+  mutate(DATE = as_date(DATE), HOUR = as.integer(HOUR))
+
+re_df |> count(DATE, HOUR) |> filter(n > 1)     # should return nothing
+
+counts_seasonal_metadata <- counts_seasonal |>
+  mutate(HOUR = as.integer(HOUR)) |>
+  left_join(re_df, by = c("DATE", "HOUR"))
+# dim(counts_seasonal); dim(counts_seasonal_metadata) # Should be equal
+
+carbon_seasonal_metadata <- carbon_seasonal |>
+  mutate(HOUR = as.integer(HOUR)) |>
+  left_join(re_df, by = c("DATE", "HOUR"))
+# dim(carbon_seasonal); dim(carbon_seasonal_metadata)
+
+# stopifnot(nrow(counts_seasonal_metadata) == nrow(counts_seasonal))
+```
+
+```{r}
+counts_seasonal_metadata |> count(HOUR) |> print(n = 24)   # expect all 24 hours
+sum(is.na(counts_seasonal_metadata$tide_direction))         # expect a small number
+```
+
+
+## QC tide height & direction
+
+First Exploring tide height
+
+```{r}
+counts_seasonal_metadata %>%
+  group_by(MLLW, tide_direction, DIFFERENCE) %>%
+  summarize(COUNT_SUM = sum(COUNT)) %>%
+  ggplot(aes(x = DIFFERENCE, y = COUNT_SUM, fill = tide_direction)) +
+  geom_point(shape = 21) +
+  scale_y_log10()
+```
+
+
+This is how we are "de-tiding".
+
+```{r}
+counts_seasonal_metadata_clean <- counts_seasonal_metadata %>%
+  filter(tide_direction != "Outgoing")
+
+carbon_seasonal_metadata_clean <- carbon_seasonal_metadata %>%
+  filter(tide_direction != "Outgoing")
+```
+
+### Save all data
+```{r}
+save(seasons, counts_seasonal_metadata_clean, carbon_seasonal_metadata_clean, file = "ifcb-data-compiled_09202026.RData")
+```
+
+
+# Map
+
+```{r}
+# install.packages(c("googleway", "ggrepel", 
+# "ggspatial", "libwgeom", "sf", "rnaturalearth", "rnaturalearthdata"))
+
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(sf)
+
+world <- ne_countries(scale='medium',returnclass = 'sf')
+class(world)
+```
+
+## Map of whole Gulf region
+
+```{r}
+ggulf <- ggplot(data = world) +
+  geom_sf(aes(fill = region_wb)) +
+  annotate(geom = "text", x = -90, y = 26, label = "", 
+     fontface = "italic", color = "grey22", size = 6) +
+  coord_sf(xlim = c(-102.15, -74.12), ylim = c(7.65, 33.97), expand = FALSE) +
+  scale_fill_viridis_d(option = "plasma") +
+  theme(legend.position = "none", axis.title.x = element_blank(), 
+     axis.title.y = element_blank(), panel.background = element_rect(fill = "azure"), 
+     panel.border = element_rect(fill = NA))
+ggulf
+```
+
+```{r, fig.width=7, fig.height=7}
+# MAP
+ggplot(data = world) +
+  geom_sf(color = "black", linewidth = 0.6, fill = "grey10", alpha = 0.8) +
+  # Region of study
+  coord_sf(xlim = c(-100, -80), ylim = c(22, 32), expand = FALSE) +
+  #
+  # Add data points for stations
+  # annotate("point", x = -94.8, y = 29.3, size = 10, shape = 21, color = "red", fill = "red") +
+  # geom_point(aes(x = -94.8, y = 29.3), shape = 21, size = 5) +
+  # geom_rect(xmin = -93.4, xmax = -93.7, ymin = 27.5, ymax = 27.9, fill = "pink", color = "grey10", alpha = 0.5) + #inset
+  labs(y = "Latitude (°N)", x = "Longitude (°W)", fill = "") +
+  scale_x_reverse() +
+  theme_classic() +
+  theme(legend.position = "none",
+    axis.text = element_text(size = 10, colour="black"),
+        panel.background = element_rect(fill = "#B4C7D9"),
+        panel.border = element_rect(fill = NA))
+```
+
+
+# Session Info
+```{r}
+sessionInfo()
+```
+

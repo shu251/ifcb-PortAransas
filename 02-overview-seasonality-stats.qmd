@@ -1,0 +1,654 @@
+---
+title: "02-overview-seasonality-stats"
+format:
+  html:
+    code-fold: show
+    code-tools: true
+    code-copy: true
+    toc: true
+    toc-location: left
+    number-sections: true
+    number-depth: 2
+editor: source
+---
+
+# Set up
+
+
+Run after `01-data-compilation.qmd`
+
+```{r, warning=FALSE}
+# | warning: false
+# | message: false
+library(tidyverse)
+library(patchwork)
+library(svglite)
+library(scales)
+library(treemapify)
+library(compositions); library(vegan)
+library(clustMixType)
+library(lunar)
+```
+
+```{r}
+load("ifcb-data-compiled_09202026.RData", verbose = TRUE)
+```
+
+```{r}
+head(counts_seasonal_metadata_clean)
+```
+
+
+# Seasonal classification & anomaly check
+
+Get stats on parameters for each season. 
+
+```{r}
+min_hours_day <- 1 # hourly records required to keep a daily mean
+window_days <- 15 # +/- days around each day of year for the climatology
+min_ref_days <- 30 # minimum reference days needed to score a day
+z_cut <- 3.5  # (abs(robust z)) above this = anomalous
+pct_lo <- 0.05 # seasonal lower threshold percentile
+pct_hi <- 0.95   # seasonal upper threshold percentile
+anomaly_vars <- c("SAL", "gage_height_ft", "TEMP", "discharge_cfs") # any of TEMP, SAL, gage_height_ft, discharge_cfs
+```
+
+```{r}
+head(seasons)
+```
+
+
+```{r}
+thresholds <- counts_seasonal_metadata_clean |>
+  select(season = SEASON, TEMP, SAL, PRECIP_in, gage_height_ft, discharge_cfs) |> 
+  distinct() |> 
+  pivot_longer(cols = -c(season)) |> 
+  drop_na(value) |> 
+  group_by(season, name) |>
+  summarise(
+    n_days = n(), #Number of days
+    min = min(value), # min value
+    mean = mean(value),
+    max = max(value),
+    p05 = quantile(value, pct_lo), # percent low threshold 
+    p95 = quantile(value, pct_hi), # percent high threshold
+    .groups = "drop") |>
+  left_join(select(seasons, season, 
+                   dates, start_doy, 
+                   end_doy), by = "season") |>
+  select(season, dates, start_doy, 
+         end_doy, name, n_days, 
+         min, p05, mean, p95, max) |>
+  arrange(name, season)
+```
+
+```{r}
+thresholds
+```
+
+Quick table environmental parameters.
+```{r}
+thresholds_wide <- thresholds |>
+  mutate(across(c(min, p05, mean, p95, max), ~ signif(.x, 4))) |>
+  mutate(range = str_c(min, " / ", mean, " / ", max,
+                       "  (", p05, "-", p95, ")")) |>
+  select(season, dates, name, range) |>
+  pivot_wider(names_from = name, values_from = range)
+
+thresholds_wide
+```
+
+### Storm summary
+
+```{r}
+head(counts_seasonal_metadata_clean)
+# unique(counts_seasonal_metadata_clean$storm_id)
+unique(counts_seasonal_metadata_clean$storm_phase)
+```
+
+
+```{r}
+storm_sum <- counts_seasonal_metadata_clean |> 
+  filter(storm_phase == "storm") |> 
+  # select(storm_end_utc, storm_start_utc)
+  mutate(storm_duration = ceiling(as.numeric((ymd_hms(storm_end_utc) - ymd_hms(storm_start_utc)), "days"))) |> 
+  select(season = SEASON, storm_id, storm_type, tropical_system, severity_score, storm_duration) |> 
+  distinct() |> 
+  group_by(season, storm_type) |> 
+  summarize(NUM_OF_STORMS = n(),
+            SEVERITY_MIN = min(severity_score),
+            SEVERITY_MAX = max(severity_score),
+            SEVERITY_MEAN = mean(severity_score),
+            STORM_LENGTH_MIN = min(storm_duration),
+            STORM_LENGTH_MAX = max(storm_duration),
+            STORM_LENGTH_MEAN = mean(storm_duration))
+storm_sum
+
+# unique(storm_sum$tropical_system)
+```
+
+# Overview figure: annual seasonality of environmental parameters
+
+One-year composite (day of year on the x-axis) of the environmental record. Each line is the multi-year mean; the ribbon is the spread across years. Points are storm events (start date), placed at that year's value. Dashed lines connect across weeks with too few years of data.
+
+## Parameters
+
+```{r}
+bin_days <- 7 # width of each day-of-year bin (days)
+min_hours_bin <- 24 # minimum sampled hours in a year x bin to keep it (IFCB sampling is not continuous)
+min_years_bin <- 3 # minimum distinct years required to report a bin mean
+band_type <- "sd" # spread across years shown as ribbon: "sd" (std deviation) or "se" (std error of the mean)
+env_labels <- c(TEMP = "Temperature (\u00b0C)",
+                SAL = "Salinity",
+                PRECIP_in = "Precipitation (in per day)",
+                gage_height_ft = "Gauge height (ft)",
+                discharge_cfs = "Discharge (1000 cfs)",
+                MLLW = "Water level (m MLLW)") # panel order = order here
+```
+
+```{r}
+month_starts <- yday(as_date(str_c("2001-", 1:12, "-01"))) # doy of the first of each month (non-leap year)
+storm_pal <- c("Severe convective" = "#c19f2c",
+               "Flood / heavy rain" = "#d96629",
+               "Cold front / norther" = "#6450a1",
+               "Coastal flood / swell" = "#009E73",
+               "Tropical cyclone" = "#642d5e") # colourblind-safe, one per storm type
+```
+
+## Hourly to weekly bins by year
+
+Hourly environmental records are collapsed to one value per year and day-of-year bin. All parameters are averaged over the sampled hours; precipitation is the mean hourly rate scaled to inches per day (IFCB sampling is not continuous, so a sum over sampled hours would be biased).
+
+```{r}
+env_hourly <- counts_seasonal_metadata_clean |>
+  select(DAY, YEAR, doy, all_of(names(env_labels))) |>
+  distinct() |> # counts are in long format, so collapse to one row per hour
+  mutate(doy = pmin(doy, 365), # fold leap day into Dec 31
+         bin = (doy - 1) %/% bin_days + 1, # 1 = Jan 1-7, etc.
+         discharge_cfs = discharge_cfs / 1000)
+head(env_hourly)
+```
+
+```{r}
+env_year_bin <- env_hourly |>
+  pivot_longer(cols = all_of(names(env_labels)), names_to = "name", values_to = "value") |>
+  drop_na(value) |>
+  group_by(name, YEAR, bin) |>
+  summarise(value = mean(value),
+            n_hours = n(),
+            .groups = "drop") |>
+  mutate(value = if_else(name == "PRECIP_in", value * 24, value)) |> # in per hour -> in per day
+  filter(n_hours >= min_hours_bin) # drop thinly sampled year x bin combinations
+head(env_year_bin)
+```
+
+## Mean and spread across years
+
+```{r}
+env_clim <- env_year_bin |>
+  group_by(name, bin) |>
+  summarise(n_years = n_distinct(YEAR),
+            mean = mean(value),
+            sd = sd(value),
+            .groups = "drop") |>
+  mutate(se = sd / sqrt(n_years),
+         spread = if (band_type == "se") se else sd) |>
+  right_join(expand_grid(name = names(env_labels), bin = 1:ceiling(365 / bin_days)),
+             by = c("name", "bin")) |> # add empty rows so gaps are explicit
+  mutate(missing = is.na(mean) | n_years < min_years_bin,
+         across(c(mean, sd, se, spread), ~ if_else(missing, NA_real_, .x)),
+         x_doy = (bin - 1) * bin_days + (bin_days + 1) / 2, # bin midpoint
+         name = factor(name, levels = names(env_labels)))
+env_clim |> filter(missing) |> count(name)
+```
+
+```{r}
+write.csv(env_clim, file = "output-data/env-annual-climatology.csv", row.names = FALSE)
+```
+
+## Storm events
+
+Each storm is placed at its start date, at that year's binned value of each parameter.
+
+```{r}
+storm_events <- counts_seasonal_metadata_clean |>
+  filter(storm_phase == "storm") |>
+  transmute(storm_id, storm_type, YEAR, doy = pmin(doy, 365)) |>
+  group_by(storm_id, storm_type, YEAR) |>
+  summarise(doy = min(doy), .groups = "drop") |> # first day of the storm
+  mutate(bin = (doy - 1) %/% bin_days + 1,
+         x_doy = doy)
+head(storm_events)
+```
+
+```{r}
+storm_points <- storm_events |>
+  inner_join(env_year_bin, by = c("YEAR", "bin"), relationship = "many-to-many") |> # one point per storm per parameter
+  mutate(name = factor(name, levels = names(env_labels)),
+         storm_type = factor(storm_type, levels = names(storm_pal)))
+storm_points |> distinct(storm_id, storm_type) |> count(storm_type)
+```
+
+## Season shading
+
+Season boundaries come from the `seasons` table. Cool wraps the new year, so it is split into two rectangles.
+
+```{r}
+season_rects <- seasons |>
+  mutate(xmin = list(start_doy), xmax = list(end_doy)) |>
+  select(season, start_doy, end_doy) |>
+  pmap_dfr(function(season, start_doy, end_doy) {
+    if (end_doy >= start_doy) {
+      tibble(season, xmin = start_doy - 0.5, xmax = end_doy + 0.5)
+    } else {
+      tibble(season, xmin = c(0.5, start_doy - 0.5), xmax = c(end_doy + 0.5, 365.5)) # wraps the year
+    }
+  }) |>
+  mutate(shade = season %in% c("Spring freshening", "Autumn low-inflow")) # alternate shading
+season_rects
+```
+
+## Plot environmental data
+
+```{r}
+season_pal <- c("Cool" = "#5d4e62", 
+                "Spring freshening" = "#bccbae",
+                "Hot hypersaline" = "#cc5500", 
+                "Autumn low-inflow" = "#ffbf00")
+```
+ 
+ 
+### Season color bar
+
+A single bar spanning the same day-of-year axis as the panels below.
+
+```{r}
+season_bar <- ggplot(season_rects) +
+  geom_rect(aes(xmin = xmin, xmax = xmax, ymin = 0, ymax = 1, fill = season),
+            colour = "white", linewidth = 0.4) +
+  # geom_text(data = season_rects |> group_by(season) |> slice_max(xmax - xmin, n = 1), # label the longest piece of a wrapped season
+            # aes(x = (xmin + xmax) / 2, y = 0.5, label = season),
+            # colour = "white", fontface = "bold", size = 3.6) +
+  scale_x_continuous(limits = c(0.5, 365.5), expand = c(0, 0)) +
+  scale_fill_manual(values = season_pal, guide = "none") +
+  theme_void()
+```
+
+Solid lines are runs of consecutive bins; the dashed line bridges bins with missing data.
+
+```{r}
+env_runs <- env_clim |>
+  arrange(name, bin) |>
+  group_by(name) |>
+  mutate(run = cumsum(missing)) |> # a new run starts after each missing bin
+  ungroup() |>
+  filter(!missing)
+```
+
+### Define environmental panels
+
+```{r}
+env_panels <- ggplot() +
+  geom_rect(data = filter(season_rects, shade),
+            aes(xmin = xmin, xmax = xmax, 
+                ymin = -Inf, ymax = Inf),
+            fill = "grey92") +
+  # RIBBON for spread
+  geom_ribbon(data = env_runs,
+              aes(x = x_doy, ymin = if_else(name == "PRECIP_in", pmax(mean - spread, 0), mean - spread), # stop at 0
+                  ymax = mean + spread,
+                  group = interaction(name, run)),
+              fill = "grey20", alpha = 0.4) +
+  # Get NAs filled in with dash. shows gaps
+  geom_line(data = env_runs, 
+            aes(x = x_doy, y = mean),
+            linetype = "dashed", 
+            color = "grey30", linewidth = 0.4) +
+  geom_line(data = env_runs, aes(x = x_doy, y = mean, group = interaction(name, run)),
+            color = "black", linewidth = 0.7) + # solid where consecutive bins exist
+  geom_point(data = storm_points,
+             aes(x = x_doy, y = value, fill = storm_type),
+             shape = 21, color = "white", stroke = 0.4, size = 3, alpha = 0.9) +
+  facet_grid(name ~ ., scales = "free_y", switch = "y",
+             labeller = labeller(name = env_labels)) +
+  scale_x_continuous(breaks = month_starts + 14, labels = month.abb,
+                     limits = c(0.5, 365.5), expand = c(0, 0)) +
+  scale_fill_manual(values = storm_pal, name = "Storm type", drop = FALSE) +
+  guides(fill = guide_legend(nrow = 2, override.aes = list(size = 3))) +
+  labs(x = "", y = "") +
+  theme_bw(base_size = 12) +
+  theme(strip.placement = "outside",
+        strip.background = element_blank(),
+        strip.text.y.left = element_text(angle = 90),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.spacing.y = unit(0.4, "lines"),
+        legend.position = "bottom")
+```
+
+
+### Stack
+
+Stack the season bar on top of the panels.
+
+```{r}
+#| fig-height: 11
+#| fig-width: 9
+env_plot <- season_bar / env_panels + plot_layout(heights = c(0.05, 1))
+env_plot
+```
+Parameters: storm type is shown. The line is the mean across all 9 years of data, binned (averaged) by 7 day increments. And ribbon around the line is showing the standard deviation across years. Dashed lines are connecting where there is less than 3 years of data ,usually a big missing gap.
+
+
+# Seasonal anomalies
+
+```{r}
+circ_dist <- function(a, b, n = 366) pmin(abs(a - b), n - abs(a - b))
+```
+
+Pool each day of year across all years and sets a window number of days to consider. 
+
+```{r}
+# climatology <- function(dat) {
+#   # dat: doy, value for one variable
+#   map_dfr(1:366, function(d) {
+#     ref <- dat$value[circ_dist(dat$doy, d) <= window_days]
+#     tibble(doy = d,
+#            n_ref = length(ref),
+#            clim_median = median(ref),
+#            clim_mad = 1.4826 * mad(ref, constant = 1))
+#   })
+# }
+
+min_ref_years <- 4 # minimum distinct other years in the window to score a day
+
+climatology <- function(dat) {
+  # dat: year, doy, value for one variable; each year is scored against the other years
+  expand_grid(year = unique(dat$year), doy = 1:366) |>
+    mutate(stats = map2(year, doy, \(y, d) {
+      in_ref <- dat$year != y & circ_dist(dat$doy, d) <= window_days
+      ref <- dat$value[in_ref]
+      tibble(n_ref = length(ref),
+             n_ref_years = n_distinct(dat$year[in_ref]),
+             clim_median = median(ref),
+             clim_mad = 1.4826 * mad(ref, constant = 1))
+    })) |>
+    unnest(stats)
+}
+```
+
+Score each parameters based on a z score within each season.
+```{r}
+scored <- counts_seasonal_metadata_clean |>
+  select(season = SEASON, DATE, doy, year = YEAR, TEMP, SAL, PRECIP_in, gage_height_ft, discharge_cfs) |> 
+  distinct() |> 
+  pivot_longer(cols = -c(season, DATE, year, doy)) |> 
+  drop_na(value) |> 
+  filter(name %in% anomaly_vars) |>
+  group_by(name) |>
+  group_modify(function(dat, key) {
+    clim <- climatology(dat)
+      dat |>
+        left_join(clim, by = c("year", "doy")) |>
+  mutate(robust_z = if_else(n_ref_years >= min_ref_years & clim_mad > 0,
+                            (value - clim_median) / clim_mad, NA_real_))
+      }) |>
+  ungroup() |>
+  left_join(select(thresholds, season, name, p05, p95),
+            by = c("season", "name")) |>
+  mutate(flag_z = abs(robust_z) > z_cut,
+    flag_seasonal = value < p05 | value > p95,
+    direction = case_when(
+      robust_z > 0 ~ "high", robust_z < 0 ~ "low",
+      TRUE ~ NA_character_))
+
+```
+
+* Climate median and mad represent the typical spread for the values in question. The MAD is the median absolute deviation.
+* robust z is a z-score, with (value - clim_median)/climate_mad, it considers the number of days of a specific value. 
+* when the value is outside the p05-p95 value, it is noted as "TRUE" in flag seasonal and the direction shows if the value is higher or lower than the expected seasonal value.
+
+To look for seasonal anomalies, subset for `flag_seasonal == TRUE`. 
+
+```{r}
+scored
+```
+
+Auto detection of anaomalous weather events
+```{r}
+events <- scored |>
+  filter(flag_z, !is.na(direction)) |>
+  arrange(name, direction, DATE) |>
+  group_by(name, direction) |>
+  mutate(event_id = cumsum(c(TRUE, diff(DATE) != 1))) |>
+  group_by(name, direction, event_id) |>
+  summarise(
+    start = min(DATE),
+    end  = max(DATE),
+    days = n(),
+    peak_value = value[which.max(abs(robust_z))],
+    peak_z = round(robust_z[which.max(abs(robust_z))], 1),
+    season = season[which.max(abs(robust_z))],
+    days_outside_seasonal_range = sum(flag_seasonal),
+    .groups = "drop"
+  ) |>
+  select(-event_id) |>
+  arrange(name, start)
+events
+```
+
+```{r}
+season_pal <- c("Cool" = "#5d4e62", "Spring freshening" = "#bccbae",
+                "Hot hypersaline" = "#cc5500", "Autumn low-inflow" = "#ffbf00")
+
+anom_fig <- scored |>
+  ggplot(aes(DATE, value)) +
+  geom_line(colour = "grey70", linewidth = 0.3) +
+  geom_point(data = filter(scored, flag_z),
+             aes(colour = season), size = 1.6) +
+  scale_colour_manual(values = season_pal, name = "Season of anomaly") +
+  facet_wrap(~ name, ncol = 1, scales = "free_y") +
+  labs(x = NULL, y = NULL,
+       title = "Anomalous days against a day-of-year climatology",
+       subtitle = str_glue("Flagged where |robust z| > {z_cut}; daily means")) +
+  theme_bw()
+
+anom_fig
+```
+
+## Weather anomaly data
+
+```{r}
+save(scored, events, file = "output-data/weather-events.RData")
+```
+
+
+# Set seasonal blocks
+
+## Data set up & parameters
+
+
+```{r}
+#| label: params
+min_hours_detected <- 100 # a CELL_ID must be detected in at least this many hours to be analysed (set 0 to keep all)
+min_obs_block <- 200      # minimum hourly observations for a season block to be analysed
+min_span_h <- 240          # minimum span (hours) a block must cover; the periodogram scan is capped at span / 3
+detrend_span <- 0.75      # loess span for removing the slow within-season trend
+```
+
+
+Builds a timestamp and keeps only the columns needed. `parse_number()` handles `HOUR` stored as text (e.g. "13:00"), and non-numeric `COUNT` values become `NA`.
+ 
+```{r}
+#| label: clean
+hourly_long <- counts_seasonal_metadata_clean |>
+  mutate(
+    DATE = as_date(DATE),
+    HOUR = parse_number(as.character(HOUR)),          # 0-23 as a number
+    COUNT = suppressWarnings(as.numeric(COUNT)),
+    datetime = as.POSIXct(DATE, tz = "UTC") + HOUR * 3600   # hourly timestamp
+  ) |>
+  filter(!is.na(datetime), !is.na(SEASON)) |>          # drop rows that failed to parse
+  select(datetime, SEASON, CELL_ID, COUNT)
+ 
+head(hourly_long)
+```
+
+
+Check for rows lost or unparsed dates before continuing.
+ 
+```{r}
+#| label: clean-check
+c(rows_in = nrow(counts_seasonal_metadata_clean), rows_kept = nrow(hourly_long))
+range(hourly_long$datetime)
+```
+
+# Define season blocks
+ 
+Each uninterrupted run of one season in one year is a block. Blocks are analysed separately so that gaps and season boundaries never enter a spectrum, and so that repeats can be compared across years.
+
+This is necessary for downstream periodicity, recurring trends analysis - because we need to detrend.
+
+```{r}
+#| label: sampled-hours
+sampled_hours <- hourly_long |>
+  distinct(datetime, SEASON) |>
+  arrange(datetime)
+```
+ 
+```{r}
+#| label: blocks
+season_blocks <- sampled_hours |>
+  mutate(BLOCK_ID = cumsum(SEASON != lag(SEASON, default = first(SEASON)))) |>  # new id at each season change
+  group_by(BLOCK_ID) |>
+  mutate(BLOCK_YEAR = year(min(datetime) + (max(datetime) - min(datetime)) / 2)) |>   # year of block midpoint
+  ungroup()
+
+season_blocks 
+# season_blocks |> distinct(BLOCK_ID, SEASON, BLOCK_YEAR) |> count(SEASON, BLOCK_YEAR) |> filter(n > 1) #returns nothing
+```
+
+
+Using the *n_hours* parameter to determine minimum observations for season block to consider periodic time.
+
+## Build the series
+ 
+Every CELL_ID that passes the detection filter, plus a total-cells series for reference. Sampled hours with no detection are set to zero.
+ 
+```{r}
+#| label: top-taxa
+top_taxa <- hourly_long |>
+  group_by(CELL_ID) |>
+  summarise(hours_detected = sum(COUNT > 0, na.rm = TRUE)) |>   # hours with at least one detection
+  filter(hours_detected >= min_hours_detected) |>
+  pull(CELL_ID)
+ 
+length(top_taxa)
+```
+
+```{r}
+#| label: series
+total_series <- hourly_long |>
+  group_by(datetime) |>
+  summarise(COUNT = sum(COUNT, na.rm = TRUE)) |>
+  mutate(CELL_ID = "All cells")
+ 
+taxa_series <- sampled_hours |>
+  select(datetime) |>
+  cross_join(tibble(CELL_ID = top_taxa)) |>          # every sampled hour x every taxon
+  left_join(
+    hourly_long |> group_by(datetime, CELL_ID) |> 
+      summarise(COUNT = sum(COUNT, na.rm = TRUE), .groups = "drop"),
+    by = c("datetime", "CELL_ID")
+  ) |>
+  replace_na(list(COUNT = 0))                         # absent = zero
+```
+
+
+```{r}
+#| label: series-combine
+head(taxa_series) 
+head(total_series)
+count_series <- bind_rows(total_series, taxa_series)
+# count_series
+```
+
+
+# Log-transform and detrend within each block
+ 
+Log10(x + 1) tames the orders-of-magnitude range. The loess residual removes slow trends that would otherwise dominate the long-period end of the spectrum.
+ 
+Defines a safe detrending function. It falls back to mean-centering when a series is too short or constant for loess.
+ 
+```{r}
+#| label: detrend-function
+detrend_loess <- function(hrs, y, span) {
+  ok <- is.finite(hrs) & is.finite(y)
+  # If fewer than 20 observations, or fewer than 3 unique entires it will skip the detrended step.
+  if (sum(ok) < 20 || length(unique(y[ok])) < 3) return(y - mean(y, na.rm = TRUE))
+  fit <- loess(y[ok] ~ hrs[ok], span = span, degree = 1)
+  out <- rep(NA_real_, length(y))
+  out[ok] <- residuals(fit)
+  out
+}
+```
+ 
+Detrending step. This takes individual taxa and all the count data and performs a detrending step. Output is detrended log counts and there will be one block per taxa. Use this for periodicity and recurrence trend mining. 
+
+```{r}
+#| label: detrend
+detrended <- count_series |>
+  filter(!is.na(datetime)) |>
+  inner_join(season_blocks, by = "datetime") |>
+  group_by(CELL_ID, BLOCK_ID) |>
+  filter(n() >= min_obs_block, # note from params
+         as.numeric(difftime(max(datetime), min(datetime), units = "hours")) >= min_span_h) |>
+  mutate(
+    hrs = as.numeric(difftime(datetime, min(datetime, na.rm = TRUE), units = "hours")),
+    # hrs = as.numeric(difftime(datetime, min(datetime), units = "hours")),  # hours since block start
+    LOG_COUNT = log10(COUNT + 1),
+    # fit a linear loess of the log count data
+    ## See function above
+    RESID = detrend_loess(hrs, LOG_COUNT, detrend_span)
+  ) |>
+  ungroup() |>
+  filter(!is.na(RESID))
+```
+
+```{r}
+head(detrended)
+```
+
+```{r}
+#| label: block-summary
+detrended |> distinct(CELL_ID, SEASON, BLOCK_YEAR, BLOCK_ID) |> count(SEASON, name = "n_taxa_blocks")
+```
+
+### Save detrended data
+ 
+```{r}
+#| label: save
+write.csv(detrended, file = "output-data/hourly-season-blocks.csv", row.names = FALSE)
+```
+
+```{r}
+# Unique years within each season (should return nothing)
+detrended |> distinct(SEASON, BLOCK_ID, BLOCK_YEAR) |> count(SEASON, BLOCK_YEAR) |> filter(n > 1)
+
+# Residuals centered and finite (mean near 0, no NA)
+detrended |> group_by(CELL_ID, BLOCK_ID) |>
+  summarise(m = mean(RESID), s = sd(RESID), .groups = "drop") |>
+  summarise(max_abs_mean = max(abs(m)), n_flat = sum(s == 0), n_na = sum(is.na(s)))
+
+# How sparse are the series? (prevalence = share of hours with a non-zero count)
+detrended |> group_by(CELL_ID, BLOCK_ID) |>
+  summarise(prev = mean(COUNT > 0), .groups = "drop") |>
+  summarise(median_prev = median(prev), share_under_10pct = mean(prev < 0.10))
+```
+
+
+# Session info
+```{r}
+sessionInfo()
+```
+
