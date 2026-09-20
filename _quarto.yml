@@ -2,15 +2,28 @@ project:
   type: website
   output-dir: docs
   render:
-    - ifcb-data-wrangle.qmd
+    - environmental-data-compilation.qmd
+    - 01-data-compilation.qmd
+    - 02-overview-seasonality-stats.qmd
+    - 03-periodicity-recurrence.qmd
+    - 04-trophic-assignment-taxa-profile.qmd
 
 
 website:
   title: "IFCB analysis | Port Aransas"
   navbar:
     left:
-      - href: ifcb-data-wrangle.qmd
-        text: Analysis
+      - href: environmental-data-compilation.qmd
+        text: Collect environmental data
+      - href: 01-data-compilation.qmd
+        text: Import counts & add metadata
+      - href: 02-overview-seasonality-stats.qmd
+        text: Overview of data
+      - href: 03-periodicity-recurrence.qmd
+        text: Evaluate periodic signals
+      - href: 04-trophic-assignment-taxa-profile.qmd
+        text: Trophic assignment & taxa profiles
+      
 
 format:
   html:
