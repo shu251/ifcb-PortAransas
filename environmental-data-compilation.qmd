@@ -1,0 +1,434 @@
+---
+title: "environmental-metadata"
+format:
+  html:
+    code-fold: show
+    code-tools: true
+    code-copy: true
+    toc: true
+    toc-location: left
+    number-sections: true
+    number-depth: 2
+editor: source
+---
+
+# Set-up
+
+```{r, warning=FALSE}
+# | warning: false
+# | message: false
+library(tidyverse)
+library(patchwork)
+library(svglite)
+library(scales)
+library(treemapify)
+library(compositions); library(vegan)
+library(clustMixType)
+library(lunar)
+```
+
+# Import Gulf metadata
+
+## Temperature & Salinity
+
+Import from TABS D manual pull of data.
+
+The raw file has 1,084 exact duplicate rows (dropped below with `distinct()`). It also has ~13,000 timestamps with two *different* temp/salinity readings for the same hour (e.g. `2012-04-09 08:00` has both 23.8C/33.9 psu and 24.9C/26.9 psu on record) — a real discrepancy, likely two overlapping sensor deployments or data pulls spliced together, not a parsing artifact. That's left unresolved here (flagged as a follow-up); it gets arbitrarily collapsed to one reading per hour later, in `hourly_metadata`.
+
+```{r}
+tabs_d <- read_delim(file = "input-env-data/TABS_D/tabs_D_salt.asc",
+                     col_names = FALSE, delim = " ") %>%
+  distinct()
+head(tabs_d)
+# ?read_delim()
+
+tabs_d_qc <- tabs_d %>%
+  select(date = X1, time = X2, temp = X4, sal = X9)
+head(tabs_d_qc)
+tabs_temp_sal_2010 <- tabs_d_qc %>% 
+  mutate(DATE = mdy(date),
+         MONTH = month(DATE),
+         DAY = day(DATE),
+         HOUR = hour(hms(time)),
+         MIN = minute(hms(time))) %>% 
+  select(DATE, MONTH, DAY, HOUR, MIN, TEMP = temp, SAL = sal) %>% 
+  filter(as_date(DATE) <= as_date("2017-08-24")) %>% 
+  add_column(NOTES = "temp and salinity from TABS D data water property data")
+
+range(tabs_temp_sal_2010$DATE)
+```
+
+Water Property Data (from TABS website).
+
+Date \| Time \| WaterT \|Conduct\| Salt \| Chloro \|Crude Oil\| Fuel Oil\| WaterT \| \| (UTC) \| (°C) \| \| \| \| \| \| (°C) \| ==========+========+========+=======+=======+=========+=========+=========+=========+ 04/14/2025 00:00:00 21.65 47.54 33.37 0.00 0.00 04/14/2025 00:30:00 21.60 47.54 33.40 0.00 0.00 04/14/2025 01:00:00 21.64 47.58 33.40 0.00 0.00
+
+Above data from TABs starts in 2010. Import other TABS data that has earlier temperature values. Column headers are: \| (UTC) \| (cm/s)\| (cm/s)\| (cm/s)\| (\xb0T) \| (\xb0C) \|
+
+```{r}
+tabs_temp_vel <- read_delim("input-env-data/TABS_D/TABS_D_vel_2007-2016.txt", skip = 3, delim = "\t", col_names = FALSE)
+head(tabs_temp_vel)
+# ?read_delim()
+temp_tabs <- tabs_temp_vel %>% 
+  separate(X1, c("date", "time", "cm", "cm2", "cm3", "temp"), sep = "   ") %>% 
+  mutate(DATE_TIME = str_trim(date), TEMP = str_trim(temp)) %>% 
+  select(DATE_TIME, TEMP) %>% distinct() %>%  
+  mutate(whole_date = mdy_hms(DATE_TIME),
+         MONTH = month(whole_date),
+         DAY = day(whole_date),
+         DATE = date(whole_date),
+         HOUR = hour(whole_date),
+         MIN = minute(whole_date)) %>% 
+  select(DATE, MONTH, DAY, HOUR, MIN, TEMP) %>% 
+  filter(as_date(DATE) >= as_date("2008-01-01") & 
+           as_date(DATE) <= as_date("2010-10-15")) %>% 
+  add_column(SAL = NA) %>% 
+  add_column(NOTES = "temp from TABS D water vel data")
+  
+head(temp_tabs)
+```
+
+Combine all temperature data and some salinity data.
+
+```{r}
+temp_sal_tabs <- rbind(temp_tabs, tabs_temp_sal_2010)
+head(temp_sal_tabs)
+range(temp_sal_tabs$DATE)
+```
+
+Import additional salinity data.
+
+```{r}
+sal_08 <- read.csv("input-env-data/NERRS_Sal/marscwq2008.csv")
+
+sal_09 <- read.csv("input-env-data/NERRS_Sal/marscwq2009.csv")
+
+sal_10 <- read.csv("input-env-data/NERRS_Sal/marscwq2010.csv")
+
+sal_df <- bind_rows(sal_08, sal_09, sal_10) %>%
+  select(DateTimeStamp = DateTimeStamp, SAL = Sal) %>%
+  mutate(DATE_TIME = mdy_hm(DateTimeStamp),
+         MONTH = month(DATE_TIME),
+         DAY = day(DATE_TIME),
+         HOUR = hour(DATE_TIME),
+         MIN = minute(DATE_TIME),
+         DATE = date(DATE_TIME)) %>%
+  select(DATE, MONTH, DAY, HOUR, MIN, SAL)
+```
+
+
+
+
+## River height gauge
+
+Run `input-env-data/metadata-retrival/USGS pulling data.R`
+
+```{r}
+usgs_clean <- read.csv("input-env-data/usgs_07374000_cleaned.csv")
+head(usgs_clean)
+# hist(usgs_clean$gage_height_ft)
+
+# ggplot(usgs_clean, aes(x = date, y = gage_height_ft)) +
+# geom_bar(stat = "identity")
+```
+
+Clean up output and set up lubridate.
+
+```{r}
+discharge_ft <- usgs_clean %>% 
+  select(date, gage_height_ft) %>% 
+  mutate(DATE = ymd(date),
+         MONTH = month(DATE),
+         DAY = day(DATE)) %>% 
+  select(-date)
+head(discharge_ft)
+```
+
+Add water gauge height to temperature and salinity data
+
+```{r}
+temp_sal_tabs_gauge <- temp_sal_tabs %>% 
+  left_join(discharge_ft)
+head(temp_sal_tabs_gauge)
+```
+
+## Rainfall
+
+
+HPCP is likely inches. Hourly Precipitation Data (HPD)
+
+```{r}
+rainfall <- read.csv("input-env-data/precipitation.csv")
+hist(rainfall$HPCP)
+```
+
+> What are rainfall units?? Is it HDCP?
+
+```{r}
+rainfall_df <- rainfall %>% select(date = DATE, PRECIP_in = HPCP) %>%
+  mutate(DATE_TIME = ymd_hm(date),
+         MONTH = month(DATE_TIME),
+         DAY = day(DATE_TIME),
+         HOUR = hour(DATE_TIME),
+         MIN = minute(DATE_TIME),
+         DATE = date(DATE_TIME)) %>% 
+  select(DATE, MONTH, DAY, HOUR, MIN, PRECIP_in)
+head(rainfall_df)
+head(temp_sal_tabs_gauge)
+# range(rainfall_df$HOUR)
+# summary(temp_sal_tabs_gauge$SAL)
+```
+
+The NOAA HPCP feed only logs a row when precipitation was recorded, so an hour with no matching row means zero rainfall, not a missing reading — fill those `NA`s with 0 rather than leaving them (and rather than dropping them later).
+
+```{r}
+head(temp_sal_tabs_gauge)
+# range(temp_sal_tabs_gauge$HOUR)
+temp_sal_gauge_rain <- temp_sal_tabs_gauge %>%
+  left_join(rainfall_df) %>%
+  mutate(PRECIP_in = replace_na(PRECIP_in, 0))
+```
+
+
+## Lunar
+
+```{r}
+lunar <- read.csv("input-env-data/Lunar cycle values.csv")
+head(lunar)
+```
+
+```{r}
+lunar_df <- lunar %>% 
+  select(Date, Phase = Moon.Phase) %>%
+  mutate(DATE = ymd(Date),
+         MONTH = month(DATE),
+         DAY = day(DATE)) %>% 
+  select(-Date)
+head(lunar_df)
+```
+
+`Phase` above is only populated on the ~4 exact event days per month (new/full/quarter) recorded in the source spreadsheet, so it's `NA` on most days. `lunar::lunar.phase()` computes a phase category for every date directly, so add `MOON_PHASE` for full daily coverage alongside it.
+
+
+```{r}
+temp_sal_gauge_rain_moon <- temp_sal_gauge_rain %>%
+  left_join(lunar_df) %>%
+  mutate(MOON_PHASE = lunar.phase(DATE, name = 8))
+head(temp_sal_gauge_rain_moon)
+
+#Add in Salinity Gaps (2008-2010)
+
+temp_sal_gauge_rain_moon <- temp_sal_gauge_rain %>%
+  rows_patch(sal_df, by = c("DATE", "MONTH", "DAY", "HOUR", "MIN"), unmatched = "ignore")
+
+head(temp_sal_gauge_rain_moon)
+```
+
+All metadata is taking shape to be at minute 0 and 30 for every hour!
+
+## Tide height
+
+see `Tide height.R` code.
+
+Download MLLW
+
+The raw file has 3,600 exact duplicate rows (e.g. all of `2007-03-01` appears twice) — drop them with `distinct()` before anything else, since they'd otherwise fan out into a many-to-many join once this gets merged with other tables.
+
+```{r}
+tide_height <- read.csv("input-env-data/port_aransas_water_levels_6min_2007_2017-4142025.csv") %>%
+  distinct()
+head(tide_height)
+range(tide_height$timestamp)
+# hist(tide_height$change)
+tmp <- tide_height %>% 
+  mutate(missing = case_when(is.na(MLLW) ~ "missing", TRUE ~ "present"))
+table(tmp$missing)
+# 21401/(21401 + 703543)
+```
+
+Subtract tide height from previous entry to see if tide is incoming or outgoing.
+
+```{r}
+tide_height_df <- tide_height %>% 
+  mutate(DATE_TIME = ymd_hm(timestamp),
+         MONTH = month(DATE_TIME),
+         DAY = day(DATE_TIME),
+         HOUR = hour(DATE_TIME),
+         MIN = minute(DATE_TIME),
+         DATE = date(DATE_TIME)) %>% 
+  filter(MIN == 0) %>% # Sample only on the hour or at 30 minutes.
+  mutate(DIFFERENCE = MLLW - lag(MLLW, default = first(MLLW))) %>% 
+  mutate(tide_direction = case_when(
+      DIFFERENCE > 0 ~ "Incoming",
+      DIFFERENCE < 0 ~ "Outgoing",
+      TRUE ~ "No Change"
+    )) %>% 
+  select(DATE, MONTH, DAY, HOUR, MIN, MLLW, DIFFERENCE, tide_direction) 
+  
+head(tide_height_df)
+hist(tide_height_df$DIFFERENCE)
+# table(tide_height_df$tide_direction)
+```
+
+Combine with all other data. Isolating times when minutes = 0
+
+`hourly_metadata` still has ~13,000 hours with more than one row (mostly the unresolved conflicting TABS D readings flagged above, plus a few other stray duplicates). Those genuinely different values aren't safe to average or discard silently, so as a stopgap this keeps the first reading per hour — a real fix needs someone to work out which reading is right (see the flagged follow-up task). This is also what was causing the many-to-many join warning below.
+
+```{r}
+temp_sal_gauge_rain_moon_tide <- temp_sal_gauge_rain_moon %>%
+  left_join(tide_height_df)
+head(temp_sal_gauge_rain_moon_tide)
+# View(temp_sal_gauge_rain_moon_tide)
+# hist(temp_sal_gauge_rain_moon_tide$SAL)
+hourly_metadata <- temp_sal_gauge_rain_moon_tide %>%
+  filter(MIN == 0) %>%
+  distinct(DATE, HOUR, .keep_all = TRUE)
+```
+
+```{r}
+temp_sal_gauge_rain_moon <- temp_sal_gauge_rain %>%
+  left_join(lunar_df) %>%
+  mutate(MOON_PHASE = lunar.phase(DATE, name = 8))
+head(temp_sal_gauge_rain_moon)
+
+#Add in Salinity Gaps (2008-2010)
+
+temp_sal_gauge_rain_moon <- temp_sal_gauge_rain %>%
+  rows_patch(sal_df, by = c("DATE", "MONTH", "DAY", "HOUR", "MIN"), unmatched = "ignore")
+
+head(temp_sal_gauge_rain_moon)
+```
+
+
+```{r}
+write.csv(temp_sal_gauge_rain_moon_tide, file = "output-data/allmetadata-07032026.csv")
+write.csv(hourly_metadata, file = "output-data/hourly_allmetadata-07032026.csv")
+```
+
+# Incorporate storms
+
+See https://www.ncei.noaa.gov/pub/data/swdi/stormevents/csvfiles/
+Downloaded 2006-2017 records. 
+
+Storm params. I want to classify when there was a storm and when we are in "post storm" which is arbitratrily 3 days. 
+```{r}
+post_storm_days <- 3
+```
+
+```{r}
+env_hourly <- read_csv("output-data/hourly_allmetadata-07032026.csv",
+                       show_col_types = FALSE) |>
+  select(-any_of("...1")) |>
+  mutate(hour_start_utc = ymd_h(paste(DATE, HOUR), tz = "UTC"),
+         hour_end_utc   = hour_start_utc + hours(1))
+```
+Get storm input
+```{r}
+storm_catalog <- read_csv("input-env-data/storms/storm_catalog_2008-2017.csv",show_col_types = FALSE) |>
+  mutate(across(c(start_utc, end_utc), ~ ymd_hms(.x, tz = "UTC")),
+         post_storm_end_utc = end_utc + days(post_storm_days)) |>
+  select(storm_id, storm_type, tropical_system, severity_score,
+         storm_start_utc = start_utc, storm_end_utc = end_utc,
+         post_storm_end_utc)
+```
+
+```{r}
+hours_key <- env_hourly |> select(hour_start_utc, hour_end_utc)
+
+```
+
+```{r}
+during_storm <- hours_key |>
+  inner_join(storm_catalog,
+             join_by(hour_end_utc > storm_start_utc,
+                     hour_start_utc <= storm_end_utc)) |>
+  mutate(storm_phase = "storm")
+```
+
+
+```{r}
+after_storm <- hours_key |>
+  inner_join(storm_catalog,
+             join_by(hour_start_utc >= storm_end_utc,
+                     hour_start_utc < post_storm_end_utc)) |>
+  mutate(storm_phase = "post_storm")
+```
+
+Assign storm classification, in a storm, "Storm", post storm = "post_storm", or none.
+```{r}
+storm_hours <- bind_rows(during_storm, after_storm) |>
+  mutate(phase_rank = if_else(storm_phase == "storm", 1L, 2L)) |>
+  arrange(hour_start_utc, phase_rank, desc(severity_score), storm_start_utc) |>
+  distinct(hour_start_utc, .keep_all = TRUE) |>
+  mutate(hours_from_storm_start = if_else(
+           storm_phase == "storm",
+           as.numeric(difftime(hour_start_utc, storm_start_utc, units = "hours")),
+           NA_real_),
+         hours_since_storm_end = if_else(
+           storm_phase == "post_storm",
+           as.numeric(difftime(hour_start_utc, storm_end_utc, units = "hours")),
+           NA_real_)) |>
+  select(hour_start_utc, storm_phase, storm_id, storm_type, tropical_system,
+         severity_score, storm_start_utc, storm_end_utc, post_storm_end_utc,
+         hours_from_storm_start, hours_since_storm_end)
+```
+
+```{r}
+env_storms <- env_hourly |>
+  left_join(storm_hours, by = "hour_start_utc") |>
+  mutate(storm_phase    = replace_na(storm_phase, "none"),
+         severity_score = replace_na(severity_score, 0L)) |>
+  select(-hour_end_utc)
+```
+
+* storm phase: storm, post storm, or none
+* when no storm, severity is 0, otherwise, 1-5 scale with 1-2 being minor.
+* storm start/end has time in UTC for when it was considered that it started.
+* post storm end in UTC - when storm ended, storm end + storm days
+* hours from storm start (tells how long it was
+* hours from storm end - hours since the storm ended
+
+
+```{r}
+write.csv(env_storms, "output-data/hourly_allmetadata_storms.csv")
+```
+
+How many storms does data cover?
+```{r}
+env_storms |> count(storm_phase)
+env_storms |> filter(storm_phase != "none") |> count(storm_phase, storm_type)
+```
+
+Storm types to consider in data:
+
+_Tropical cyclone_: tropical storm, hurricane, or storm surge that occurs
+_flood/heavy rain_: includes flash floods, heavy rain events, includes tornodao
+_cold front/Norther_ - freeze or ice storm or a high wind event that has an arctic chill or air.
+_coastal flood_: coastal floor or high surf warnings
+_severe convective_: catchall category for big thunderstorms, wind, hail, tornado
+
+## Add USGS 
+```{r}
+usgs_data <- read.csv("input-env-data/usgs_07374000_cleaned.csv")
+usgs <- usgs_data |>
+  transmute(DATE = as_date(date), discharge_cfs)
+```
+
+```{r}
+env_storms_usgs <- env_storms |> 
+  left_join(usgs, by = "DATE")
+# dim(env_storms); dim(env_storms_usgs)
+```
+
+
+
+# Combine all metadata
+
+`env_storms` has all datadata as this point.
+
+```{r}
+# head(env_storms)
+metadata_storms_env <- env_storms_usgs
+# save(metadata_storms_env, file = "input-env-data/metadata-09202026.RData")
+```
+
+
